@@ -2,6 +2,10 @@ name: CI
 
 on:
   workflow_dispatch: # allows manual triggering
+    inputs:
+      target_jobs:
+        description: 'Comma-separated job names to run (leave empty for all)'
+        required: false
   push:
     branches:
       - master
