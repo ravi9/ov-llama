@@ -75,6 +75,7 @@ The OpenVINO backend can be configured using the following environment variables
 |--------|-------------|
 | `GGML_OPENVINO_DEVICE` | Specify the target device (`CPU`, `GPU`, `NPU`). If not set, the backend automatically selects the first available device in priority order: **GPU → CPU → NPU**. When set to `NPU`, static compilation mode is enabled for optimal performance. |
 | `GGML_OPENVINO_CACHE_DIR` | Directory for OpenVINO model caching (recommended: `/tmp/ov_cache`). Enables model caching when set. **Not supported on NPU devices.** |
+| `GGML_OPENVINO_INFER_REQUEST_POOL_SIZE` | Control the maximum number of InferRequest objects per graph for parallel inference. Default: `4`, Range: `1-16`. Higher values allow more concurrent inference threads but use more memory. |
 | `GGML_OPENVINO_PROFILING` | Enable execution-time profiling. |
 | `GGML_OPENVINO_DUMP_CGRAPH` | Dump the GGML compute graph to `cgraph.txt`. |
 | `GGML_OPENVINO_DUMP_IR` | Export OpenVINO IR files with timestamps. |
@@ -83,6 +84,17 @@ The OpenVINO backend can be configured using the following environment variables
 | *`GGML_OPENVINO_STATEFUL_EXECUTION` | Enable stateful execution for better performance |
 
 *`GGML_OPENVINO_STATEFUL_EXECUTION` is an **Experimental** feature to allow stateful execution for managing the KV cache internally inside the OpenVINO model, improving performance on CPUs and GPUs. Stateful execution is not effective on NPUs, and not all models currently support this feature. This feature is experimental and has been validated only with the llama-simple, llama-cli, llama-bench, and llama-run applications and is recommended to enable for the best performance. Other applications, such as llama-server and llama-perplexity, are not yet supported.
+
+### Thread-Safety and Parallel Inference
+
+The OpenVINO backend implements per-graph InferRequest pooling to ensure thread-safe parallel inference:
+
+- **Multiple Threads, Same Model**: Each unique graph structure maintains a pool of InferRequest objects, allowing multiple threads to run parallel inference without conflicts.
+- **Request Pooling**: Threads acquire available InferRequest objects from the pool. If all requests are in use and the pool hasn't reached its maximum size, a new request is created. Otherwise, threads wait for an available request.
+- **Configuration**: The pool size is controlled by `GGML_OPENVINO_INFER_REQUEST_POOL_SIZE` (default: 4). Adjust based on your concurrency needs and memory constraints.
+- **No Global Lock**: Different graphs can run in parallel without blocking each other, maintaining high throughput in multi-model scenarios.
+
+This design enables efficient parallel inference in applications like `test-thread-safety` and multi-threaded servers without sacrificing performance or safety.
 
 ### Example Usage
 

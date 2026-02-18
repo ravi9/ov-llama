@@ -41,6 +41,17 @@
 
 // InferRequest pool for thread-safe parallel inference
 // Each graph_key has its own pool of InferRequest objects to prevent concurrent access
+// 
+// Thread-safety approach:
+// - Each graph_key (unique graph structure) gets its own pool of InferRequest objects
+// - Multiple threads can safely run parallel inference using different InferRequest instances
+// - When all requests are in use, threads wait for an available request (or create new one if under limit)
+// - Pool size is configurable via GGML_OPENVINO_INFER_REQUEST_POOL_SIZE (default: 4, max: 16)
+// 
+// This design allows:
+// - Parallel inference across different graphs (no global mutex)
+// - Parallel inference within same graph (multiple InferRequest instances per graph)
+// - Efficient resource usage (requests are reused, not recreated each time)
 struct InferRequestPool {
     struct PooledRequest {
         std::shared_ptr<ov::InferRequest> request;
