@@ -315,6 +315,10 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
     }
 
     // Handle stateful execution
+    // NOTE: Stateful execution with pooling may have issues in multi-threaded scenarios
+    // as different threads may get different InferRequest objects with different states.
+    // This is acceptable since stateful execution is experimental and documented as
+    // not supporting multi-threaded applications like llama-server.
     if (stateful && infer_request) {
         const auto * inp_pos = get_inp_pos_tensor(cgraph);
         int32_t * pos_data = (int32_t *) inp_pos->data;
