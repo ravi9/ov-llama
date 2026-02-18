@@ -32,10 +32,124 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <condition_variable>
+#include <deque>
 
 // Suppress deprecation warning for ov::Tensor::data()
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
+// InferRequest pool for thread-safe parallel inference
+// Each graph_key has its own pool of InferRequest objects to prevent concurrent access
+// 
+// Thread-safety approach:
+// - Each graph_key (unique graph structure) gets its own pool of InferRequest objects
+// - Multiple threads can safely run parallel inference using different InferRequest instances
+// - When all requests are in use, threads wait for an available request (or create new one if under limit)
+// - Pool size is configurable via GGML_OPENVINO_INFER_REQUEST_POOL_SIZE (default: 4, max: 16)
+// 
+// This design allows:
+// - Parallel inference across different graphs (no global mutex)
+// - Parallel inference within same graph (multiple InferRequest instances per graph)
+// - Efficient resource usage (requests are reused, not recreated each time)
+struct InferRequestPool {
+    struct PooledRequest {
+        std::shared_ptr<ov::InferRequest> request;
+        bool in_use = false;
+    };
+
+    std::vector<PooledRequest> requests;
+    std::mutex pool_mutex;
+    std::condition_variable pool_cv;
+    size_t max_pool_size;
+
+    explicit InferRequestPool(size_t max_size = 4) : max_pool_size(max_size) {}
+
+    // Acquire an available InferRequest or wait for one to become available
+    std::shared_ptr<ov::InferRequest> acquire() {
+        std::unique_lock<std::mutex> lock(pool_mutex);
+        
+        // First, check if any existing request is available
+        for (auto & pooled : requests) {
+            if (!pooled.in_use) {
+                pooled.in_use = true;
+                return pooled.request;
+            }
+        }
+        
+        // If we haven't reached max pool size, we'll return nullptr to signal
+        // that a new request needs to be created
+        if (requests.size() < max_pool_size) {
+            return nullptr;
+        }
+        
+        // Wait for a request to become available
+        pool_cv.wait(lock, [this] {
+            for (const auto & pooled : requests) {
+                if (!pooled.in_use) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        
+        // Find and mark an available request as in use
+        for (auto & pooled : requests) {
+            if (!pooled.in_use) {
+                pooled.in_use = true;
+                return pooled.request;
+            }
+        }
+        
+        // Should never reach here
+        return nullptr;
+    }
+
+    // Add a new request to the pool
+    void add(std::shared_ptr<ov::InferRequest> request) {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        requests.push_back({request, true});
+    }
+
+    // Release a request back to the pool
+    void release(std::shared_ptr<ov::InferRequest> request) {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        for (auto & pooled : requests) {
+            if (pooled.request == request) {
+                pooled.in_use = false;
+                pool_cv.notify_one();
+                return;
+            }
+        }
+    }
+
+    // Clear all requests from the pool
+    void clear() {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        requests.clear();
+    }
+
+    // Get an existing request by index (for cache hit scenario)
+    std::shared_ptr<ov::InferRequest> get_existing(size_t index = 0) {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (index < requests.size()) {
+            return requests[index].request;
+        }
+        return nullptr;
+    }
+};
+
+// Helper to get the pool size from environment variable or use default
+static size_t get_infer_request_pool_size() {
+    const char * pool_size_str = getenv("GGML_OPENVINO_INFER_REQUEST_POOL_SIZE");
+    if (pool_size_str) {
+        int size = atoi(pool_size_str);
+        if (size > 0 && size <= 16) {  // Reasonable limits: 1-16
+            return static_cast<size_t>(size);
+        }
+    }
+    return 4;  // Default pool size: 4 requests per graph_key
+}
 
 enum ggml_status ov_graph_compute(ggml_cgraph * cgraph) {
     try {
@@ -79,12 +193,15 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
 
     static std::mutex cache_mutex;
     static std::unordered_map<graph_key, std::shared_ptr<GgmlOvDecoder>, graph_key_hash> decoder_cache;
-    static std::unordered_map<graph_key, std::shared_ptr<ov::InferRequest>, graph_key_hash> infer_request_cache;
+    static std::unordered_map<graph_key, std::shared_ptr<InferRequestPool>, graph_key_hash> infer_request_pool_cache;
+    static std::unordered_map<graph_key, std::shared_ptr<ov::CompiledModel>, graph_key_hash> compiled_model_cache;
     static std::unordered_map<graph_key, std::vector<std::string>, graph_key_hash> ov_input_names_cache;
     static std::unordered_map<graph_key, std::vector<std::string>, graph_key_hash> ov_output_names_cache;
 
     std::shared_ptr<GgmlOvDecoder> ggml_decoder;
     std::shared_ptr<ov::InferRequest> infer_request;
+    std::shared_ptr<InferRequestPool> request_pool;
+    std::shared_ptr<ov::CompiledModel> compiled_model;
     ModelParams m_params;
     ComputeParams c_params;
     std::tie(m_params, c_params) = GgmlOvDecoder::compute_llm_params(cgraph, is_static);
@@ -118,35 +235,18 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
                 ggml_decoder->update_io(cgraph);
             }
             ggml_decoder->add_extra_inputs();
-            infer_request = infer_request_cache.at(key);
-
-            if (stateful) {
-                const auto * inp_pos = get_inp_pos_tensor(cgraph);
-                int32_t * pos_data = (int32_t *) inp_pos->data;
-                auto pos_shape = ggml_decoder->get_shape(inp_pos);
-                if (pos_data[0] == 0) {
-                    infer_request->reset_state();
-                    stateful_kv_size = pos_shape[3];
-                } else if (stateful_kv_size == static_cast<size_t>(pos_data[0])) {
-                    stateful_kv_size += pos_shape[3];
-                } else {
-                    auto states = infer_request->query_state();
-                    for (auto state : states) {
-                        auto state_tensor = state.get_state();
-                        ov::Coordinate begin = {0, 0, 0, 0};
-                        ov::Coordinate end = {state_tensor.get_shape()[0], static_cast<uint32_t>(pos_data[0]), state_tensor.get_shape()[2], state_tensor.get_shape()[3]};
-                        ov::Tensor new_state_tensor(state_tensor, begin, end);
-                        state.set_state(new_state_tensor);
-                    }
-                    stateful_kv_size = pos_data[0] + 1;
-                }
-            }
+            
+            // Get the request pool for this graph key
+            request_pool = infer_request_pool_cache.at(key);
+            // Get the compiled model for creating new requests if needed
+            compiled_model = compiled_model_cache.at(key);
 
             decoder_end_time = ggml_time_us();
             conversion_end_time = decoder_end_time;
             compile_end_time = decoder_end_time;
         } else {
-            infer_request_cache.erase(key);
+            infer_request_pool_cache.erase(key);
+            compiled_model_cache.erase(key);
 
             std::shared_ptr<ov::Model> model;
             auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph);
@@ -167,16 +267,23 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
                 ov::serialize(model, timestamped_filename);
             }
 
-            ov::CompiledModel compiled_model;
             auto remote_context = ggml_openvino_get_remote_context();
             if (remote_context.has_value()) {
-                compiled_model = core.compile_model(model, remote_context.value(), config);
+                compiled_model = std::make_shared<ov::CompiledModel>(
+                    core.compile_model(model, remote_context.value(), config));
             } else {
-                compiled_model = core.compile_model(model, device, config);
+                compiled_model = std::make_shared<ov::CompiledModel>(
+                    core.compile_model(model, device, config));
             }
             compile_end_time = ggml_time_us();
-            infer_request = std::make_shared<ov::InferRequest>(compiled_model.create_infer_request());
-            infer_request_cache[key] = infer_request;
+            
+            // Create pool and add first request
+            size_t pool_size = get_infer_request_pool_size();
+            request_pool = std::make_shared<InferRequestPool>(pool_size);
+            infer_request = std::make_shared<ov::InferRequest>(compiled_model->create_infer_request());
+            request_pool->add(infer_request);
+            infer_request_pool_cache[key] = request_pool;
+            compiled_model_cache[key] = compiled_model;
             decoder_cache[key] = ggml_decoder;
 
             std::vector<std::string> ov_input_names;
@@ -195,29 +302,74 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
     auto ov_input_names = ov_input_names_cache[key];
     auto ov_output_names = ov_output_names_cache[key];
 
-    for (size_t i = 0; i < ov_input_names.size(); i++) {
-        auto param_name = ov_input_names[i];
-        auto input_tensor = get_ov_input_tensor(ggml_decoder, param_name);
-        infer_request->set_input_tensor(i, input_tensor);
-
-        if (getenv("GGML_OPENVINO_DEBUG_INPUT")) {
-            print_input_tensor_info(param_name, input_tensor);
+    // Acquire an InferRequest from the pool
+    // If pool returns nullptr, we need to create a new request
+    infer_request = request_pool->acquire();
+    if (!infer_request) {
+        // Need to create a new InferRequest for the pool
+        // Use the cached compiled model to create a new request
+        if (compiled_model) {
+            infer_request = std::make_shared<ov::InferRequest>(compiled_model->create_infer_request());
+            request_pool->add(infer_request);
         }
     }
 
-    for (size_t i = 0; i < ov_output_names.size(); i++) {
-        auto output_tensor = get_ov_output_tensor(ggml_decoder, ov_output_names[i]);
-        infer_request->set_output_tensor(i, output_tensor);
+    // Handle stateful execution
+    // NOTE: Stateful execution with pooling may have issues in multi-threaded scenarios
+    // as different threads may get different InferRequest objects with different states.
+    // This is acceptable since stateful execution is experimental and documented as
+    // not supporting multi-threaded applications like llama-server.
+    if (stateful && infer_request) {
+        const auto * inp_pos = get_inp_pos_tensor(cgraph);
+        int32_t * pos_data = (int32_t *) inp_pos->data;
+        auto pos_shape = ggml_decoder->get_shape(inp_pos);
+        if (pos_data[0] == 0) {
+            infer_request->reset_state();
+            stateful_kv_size = pos_shape[3];
+        } else if (stateful_kv_size == static_cast<size_t>(pos_data[0])) {
+            stateful_kv_size += pos_shape[3];
+        } else {
+            auto states = infer_request->query_state();
+            for (auto state : states) {
+                auto state_tensor = state.get_state();
+                ov::Coordinate begin = {0, 0, 0, 0};
+                ov::Coordinate end = {state_tensor.get_shape()[0], static_cast<uint32_t>(pos_data[0]), state_tensor.get_shape()[2], state_tensor.get_shape()[3]};
+                ov::Tensor new_state_tensor(state_tensor, begin, end);
+                state.set_state(new_state_tensor);
+            }
+            stateful_kv_size = pos_data[0] + 1;
+        }
     }
 
-    infer_request->infer();
-    infer_end_time = ggml_time_us();
+    // Perform inference with acquired request
+    if (infer_request) {
+        for (size_t i = 0; i < ov_input_names.size(); i++) {
+            auto param_name = ov_input_names[i];
+            auto input_tensor = get_ov_input_tensor(ggml_decoder, param_name);
+            infer_request->set_input_tensor(i, input_tensor);
 
-    if (getenv("GGML_OPENVINO_DEBUG_OUTPUT")) {
+            if (getenv("GGML_OPENVINO_DEBUG_INPUT")) {
+                print_input_tensor_info(param_name, input_tensor);
+            }
+        }
+
         for (size_t i = 0; i < ov_output_names.size(); i++) {
-            const auto output_tensor = infer_request->get_output_tensor(i);
-            print_output_tensor_info(ov_output_names[i], output_tensor, output_tensor.data());
+            auto output_tensor = get_ov_output_tensor(ggml_decoder, ov_output_names[i]);
+            infer_request->set_output_tensor(i, output_tensor);
         }
+
+        infer_request->infer();
+        infer_end_time = ggml_time_us();
+
+        if (getenv("GGML_OPENVINO_DEBUG_OUTPUT")) {
+            for (size_t i = 0; i < ov_output_names.size(); i++) {
+                const auto output_tensor = infer_request->get_output_tensor(i);
+                print_output_tensor_info(ov_output_names[i], output_tensor, output_tensor.data());
+            }
+        }
+        
+        // Release the request back to the pool
+        request_pool->release(infer_request);
     }
 
     if (getenv("GGML_OPENVINO_PROFILING")) {
@@ -258,13 +410,17 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
 
     static std::mutex cache_mutex;
     static std::unordered_map<graph_key, std::shared_ptr<GgmlOvDecoder>, graph_key_hash> decoder_cache;
-    static std::unordered_map<graph_key, std::shared_ptr<ov::InferRequest>, graph_key_hash> infer_request_cache;
-    static std::unordered_map<graph_key, std::shared_ptr<ov::InferRequest>, graph_key_hash> infer_request_cache_prefill;
+    static std::unordered_map<graph_key, std::shared_ptr<InferRequestPool>, graph_key_hash> infer_request_pool_cache;
+    static std::unordered_map<graph_key, std::shared_ptr<InferRequestPool>, graph_key_hash> infer_request_pool_cache_prefill;
+    static std::unordered_map<graph_key, std::shared_ptr<ov::CompiledModel>, graph_key_hash> compiled_model_cache;
+    static std::unordered_map<graph_key, std::shared_ptr<ov::CompiledModel>, graph_key_hash> compiled_model_cache_prefill;
     static std::unordered_map<graph_key, std::vector<std::string>, graph_key_hash> ov_input_names_cache;
     static std::unordered_map<graph_key, std::vector<std::string>, graph_key_hash> ov_output_names_cache;
 
     std::shared_ptr<GgmlOvDecoder> ggml_decoder;
     std::shared_ptr<ov::InferRequest> infer_request;
+    std::shared_ptr<InferRequestPool> request_pool;
+    std::shared_ptr<ov::CompiledModel> compiled_model;
     ModelParams m_params;
     ComputeParams c_params;
     std::tie(m_params, c_params) = GgmlOvDecoder::compute_llm_params(cgraph, is_static);
@@ -301,14 +457,20 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
                 ggml_decoder->update_io(cgraph);
             }
             ggml_decoder->add_extra_inputs();
-            infer_request = is_prefill ? infer_request_cache_prefill.at(key) : infer_request_cache.at(key);
+            
+            // Get the appropriate request pool for this graph key
+            request_pool = is_prefill ? infer_request_pool_cache_prefill.at(key) : infer_request_pool_cache.at(key);
+            // Get the compiled model for creating new requests if needed
+            compiled_model = is_prefill ? compiled_model_cache_prefill.at(key) : compiled_model_cache.at(key);
 
             decoder_end_time = ggml_time_us();
             conversion_end_time = decoder_end_time;
             compile_end_time = decoder_end_time;
         } else {
-            infer_request_cache.erase(key);
-            infer_request_cache_prefill.erase(key);
+            infer_request_pool_cache.erase(key);
+            infer_request_pool_cache_prefill.erase(key);
+            compiled_model_cache.erase(key);
+            compiled_model_cache_prefill.erase(key);
 
             std::shared_ptr<ov::Model> model;
             auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph);
@@ -337,25 +499,43 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
                 ov::serialize(model_decode, timestamped_filename);
             }
 
-            ov::CompiledModel compiled_model_prefill;
-            ov::CompiledModel compiled_model_decode;
+            std::shared_ptr<ov::CompiledModel> compiled_model_prefill_ptr;
+            std::shared_ptr<ov::CompiledModel> compiled_model_decode_ptr;
             auto remote_context = ggml_openvino_get_remote_context();
             if (remote_context.has_value()) {
-                compiled_model_prefill = core.compile_model(model_prefill, remote_context.value(), config);
-                compiled_model_decode = core.compile_model(model_decode, remote_context.value(), config);
+                compiled_model_prefill_ptr = std::make_shared<ov::CompiledModel>(
+                    core.compile_model(model_prefill, remote_context.value(), config));
+                compiled_model_decode_ptr = std::make_shared<ov::CompiledModel>(
+                    core.compile_model(model_decode, remote_context.value(), config));
             } else {
-                compiled_model_prefill = core.compile_model(model_prefill, device, config);
-                compiled_model_decode = core.compile_model(model_decode, device, config);
+                compiled_model_prefill_ptr = std::make_shared<ov::CompiledModel>(
+                    core.compile_model(model_prefill, device, config));
+                compiled_model_decode_ptr = std::make_shared<ov::CompiledModel>(
+                    core.compile_model(model_decode, device, config));
             }
 
-            infer_request_cache_prefill[key] =
-                std::make_shared<ov::InferRequest>(compiled_model_prefill.create_infer_request());
-            infer_request_cache[key] = std::make_shared<ov::InferRequest>(compiled_model_decode.create_infer_request());
+            // Create pools and add first requests
+            size_t pool_size = get_infer_request_pool_size();
+            auto prefill_pool = std::make_shared<InferRequestPool>(pool_size);
+            auto decode_pool = std::make_shared<InferRequestPool>(pool_size);
+            
+            auto prefill_request = std::make_shared<ov::InferRequest>(compiled_model_prefill_ptr->create_infer_request());
+            auto decode_request = std::make_shared<ov::InferRequest>(compiled_model_decode_ptr->create_infer_request());
+            
+            prefill_pool->add(prefill_request);
+            decode_pool->add(decode_request);
+            
+            infer_request_pool_cache_prefill[key] = prefill_pool;
+            infer_request_pool_cache[key] = decode_pool;
+            compiled_model_cache_prefill[key] = compiled_model_prefill_ptr;
+            compiled_model_cache[key] = compiled_model_decode_ptr;
             compile_end_time = ggml_time_us();
 
             model = is_prefill ? model_prefill : model_decode;
             ggml_decoder = is_prefill ? ggml_decoder_prefill : ggml_decoder_decode;
-            infer_request = is_prefill ? infer_request_cache_prefill[key] : infer_request_cache[key];
+            request_pool = is_prefill ? prefill_pool : decode_pool;
+            compiled_model = is_prefill ? compiled_model_prefill_ptr : compiled_model_decode_ptr;
+            infer_request = is_prefill ? prefill_request : decode_request;
             decoder_cache[key] = ggml_decoder;
 
             std::vector<std::string> ov_input_names;
@@ -373,6 +553,19 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
 
     auto ov_input_names = ov_input_names_cache[key];
     auto ov_output_names = ov_output_names_cache[key];
+
+    // Acquire an InferRequest from the pool (cache hit scenario)
+    if (cache_hit && !infer_request) {
+        infer_request = request_pool->acquire();
+        if (!infer_request) {
+            // Need to create a new InferRequest for the pool
+            // Use the cached compiled model to create a new request
+            if (compiled_model) {
+                infer_request = std::make_shared<ov::InferRequest>(compiled_model->create_infer_request());
+                request_pool->add(infer_request);
+            }
+        }
+    }
 
     if (is_prefill) {
         auto inp_len = inp_pos->ne[0];
@@ -433,6 +626,11 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
                 print_output_tensor_info(ov_output_names[i], output_tensor, output_tensor.data());
             }
         }
+    }
+
+    // Release the request back to the pool
+    if (infer_request) {
+        request_pool->release(infer_request);
     }
 
     if (getenv("GGML_OPENVINO_PROFILING")) {
